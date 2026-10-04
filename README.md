@@ -4,16 +4,22 @@
 采样序列及按时间排列的装卸/运输区段，服务逐区段按上下限检测连续越界，容忍短暂
 回落、跨采样缺口自动拆段，并把每个异常归因到**异常区间内实际采样时刻数量最多**
 的区段；历史回放始终依据保存的原始采样与区段重算，旧口径写入的归因会被自动修正。
+可登记**设备温度校准档案**（不可变），分析时按采样时刻以
+`corrected=raw*scale+offset` 校准后再检测，档案号与档案内容纳入请求哈希与分析
+摘要，回放、处置复核与联单核对保持同一结果。
 
 - 🔍 连续越界检测：越界过程中的短暂回落不切断异常
 - ✂️ 缺口拆段：采样间隔达到阈值即拆成独立异常
 - 🧭 跨区段合并归因：异常可跨越区段边界，按**异常区间内实际采样时刻数量**归因
   （平局取峰值所在区段，再平取最早区段）
+- 🌡️ 设备温度校准档案：按 `[start,end)` 生效区间登记有限的正 scale 与 offset，
+  档案不可变、同号同内容幂等；分析按采样时刻校准后再检测，任一采样无覆盖或
+  档案不匹配整批不写入
 - 🔁 批次幂等：相同 `batch_id` 重复提交直接回放（含并发安全）；回放依据原始
   采样重算，不盲信历史异常行，旧口径误归因自动修正
 - 🔒 处置绑定快照：分析响应携带 `analysis_digest`（重算后异常规范 JSON 的
-  SHA-256）；处置复核必须原样回传，服务在同一 SQLite 事务内重算比对，
-  快照过期返回 `409`
+  SHA-256；指定档案的批次含档案号与档案内容）；处置复核必须原样回传，服务在
+  同一 SQLite 事务内重算比对，快照过期返回 `409`
 - 🧾 运输联单风险快照：按交接顺序提交批次清单（批次 + 摘要 + 案件 + 交接
   时间），服务在同一事务内逐批次重算核对快照、确认案件覆盖当前异常，
   全部通过才落库不可变联单，给出 `released`/`held` 结论；存在 open 案件
@@ -37,6 +43,7 @@ docker compose up --build -d
 | http://localhost:8000/api/v1/batches/{batch_id} | 回放批次结果（GET） |
 | http://localhost:8000/api/v1/cases/review | 处置复核提交（POST） |
 | http://localhost:8000/api/v1/shipments/snapshot | 运输联单风险快照（POST） |
+| http://localhost:8000/api/v1/devices/calibrations | 登记设备温度校准档案（POST） |
 
 停止：`docker compose down`（数据保留在命名卷 `coldchain-data`）。
 
@@ -91,6 +98,7 @@ curl -X POST http://localhost:8000/api/v1/batches/analyze \
 | --- | --- |
 | `batch_id` | 客户端批次号（必填），重复提交用于幂等回放 |
 | `device_id` | 设备标识 |
+| `profile_id` | 可选；设备温度校准档案号。指定后按采样时刻选取生效区间，以 `corrected=raw*scale+offset` 校准温度再检测；省略则按原始温度检测 |
 | `samples` | `{timestamp, temperature}` 列表，时间戳为 ISO-8601；不带时区按 UTC |
 | `segments` | 按时间排列的区段，`segment_type` 为 `loading`/`unloading`/`transport`；`segment_id` 可省略（自动生成 `seg-1`…）；区段不可重叠 |
 | `gap_seconds` | 采样缺口阈值，默认 600 |
@@ -102,6 +110,7 @@ curl -X POST http://localhost:8000/api/v1/batches/analyze \
 {
   "batch_id": "TRIP-001",
   "device_id": "reefer-A-17",
+  "profile_id": null,
   "cached": false,
   "anomaly_count": 1,
   "anomalies": [
@@ -139,8 +148,10 @@ curl -X POST http://localhost:8000/api/v1/batches/analyze \
 | `segment_sample_counts` | 异常区间内实际落入各区段的采样时刻数量（**跨段归因依据**，按数量降序） |
 
 顶层 `analysis_digest` 是服务端对**重算后异常规范 JSON**（与历史回放同一口径，
-键排序的紧凑 JSON）计算的 SHA-256。POST 与 GET 都会返回，且只要原始采样与
-区段不变，该值稳定一致。处置复核必须回传这个摘要，把处置结论绑定到一份
+键排序的紧凑 JSON）计算的 SHA-256；指定校准档案的批次会把 `profile_id` 与
+档案内容一并纳入摘要（见「设备温度校准档案」一节），未指定档案的批次摘要
+口径与历史版本完全一致。POST 与 GET 都会返回，且只要原始采样与区段（及档案）
+不变，该值稳定一致。处置复核必须回传这个摘要，把处置结论绑定到一份
 确定的分析快照。
 
 ### 跨区段归因示例（采样数 ≠ 重叠秒数）
@@ -172,6 +183,123 @@ curl -X POST http://localhost:8000/api/v1/batches/analyze \
 - 相同 `batch_id` + **不同请求体**：返回 `409 Conflict`（防止批次号被误用为不同数据）。
 - 并发提交同一批次：SQLite 唯一约束保证只入库一次，其余请求自动重算回放。
 - `GET /api/v1/batches/{batch_id}` 随时回放历史结果（同样重算修正）；不存在返回 `404`。
+
+## 设备温度校准档案
+
+传感器存在系统性偏差时，可以先登记**设备温度校准档案**，再让分析按档案
+校准温度。档案接口为 `POST /api/v1/devices/calibrations`：调用方提交
+`device_id`、`profile_id` 以及**按时间排序、互不重叠**的 `[start, end)`
+生效区间，每段含有限的正 `scale` 和有限 `offset`。档案落库后**不可变更**：
+相同 `profile_id` 提交相同内容幂等回放，换内容返回 `409`。
+
+```bash
+# 1) 登记校准档案（12:00 前后两段不同的校准系数）
+curl -X POST http://localhost:8000/api/v1/devices/calibrations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "device_id": "reefer-A-17",
+    "profile_id": "CAL-2026-09-A17",
+    "intervals": [
+      {"start": "2026-09-22T00:00:00Z", "end": "2026-09-22T12:00:00Z",
+       "scale": 1.05, "offset": 0.2},
+      {"start": "2026-09-22T12:00:00Z", "end": "2026-09-23T00:00:00Z",
+       "scale": 1.0, "offset": 0.0}
+    ]
+  }'
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `device_id` | 设备标识；档案与设备绑定，分析时按 `device_id` 核对归属 |
+| `profile_id` | 档案号（唯一）；相同档案号**同内容幂等回放**，换内容返回 `409` |
+| `intervals` | 按时间排序、互不重叠的 `[start, end)` 生效区间（至少 1 段；相邻区间允许首尾相接；末段右端同样不含） |
+| `intervals[].scale` | 校准斜率：**有限的正数** |
+| `intervals[].offset` | 校准截距：有限数（摄氏度） |
+
+响应（`profile_digest` 为档案内容规范 JSON 的 SHA-256）：
+
+```json
+{
+  "device_id": "reefer-A-17",
+  "profile_id": "CAL-2026-09-A17",
+  "cached": false,
+  "intervals": [
+    {"start": "2026-09-22T00:00:00.000Z", "end": "2026-09-22T12:00:00.000Z",
+     "scale": 1.05, "offset": 0.2},
+    {"start": "2026-09-22T12:00:00.000Z", "end": "2026-09-23T00:00:00.000Z",
+     "scale": 1.0, "offset": 0.0}
+  ],
+  "profile_digest": "e51b…（64 位十六进制 SHA-256）"
+}
+```
+
+```bash
+# 2) 分析时指定档案：raw 7.5/7.6 原本达标（≤8℃），
+#    校准后 7.5*1.05+0.2=8.075、7.6*1.05+0.2=8.18 越界
+curl -X POST http://localhost:8000/api/v1/batches/analyze \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "batch_id": "TRIP-CAL-001",
+    "device_id": "reefer-A-17",
+    "profile_id": "CAL-2026-09-A17",
+    "samples": [
+      {"timestamp": "2026-09-22T08:00:00Z", "temperature": 5.0},
+      {"timestamp": "2026-09-22T08:01:00Z", "temperature": 7.5},
+      {"timestamp": "2026-09-22T08:02:00Z", "temperature": 7.6},
+      {"timestamp": "2026-09-22T08:03:00Z", "temperature": 5.0}
+    ],
+    "segments": [
+      {"segment_id": "load-1", "segment_type": "loading",
+       "start": "2026-09-22T08:00:00Z", "end": "2026-09-22T08:10:00Z",
+       "lower_limit": 0.0, "upper_limit": 8.0}
+    ]
+  }'
+```
+
+响应中的峰值等温度均为**校准值**，并带回本次应用的档案号：
+
+```json
+{
+  "batch_id": "TRIP-CAL-001",
+  "device_id": "reefer-A-17",
+  "profile_id": "CAL-2026-09-A17",
+  "cached": false,
+  "anomaly_count": 1,
+  "anomalies": [
+    {
+      "seq": 0,
+      "start": "2026-09-22T08:01:00.000Z",
+      "end": "2026-09-22T08:02:00.000Z",
+      "peak_temperature": 8.18,
+      "peak_timestamp": "2026-09-22T08:02:00.000Z",
+      "direction": "high",
+      "peak_segment_id": "load-1",
+      "attributed_segment_id": "load-1",
+      "attributed_segment_type": "loading",
+      "duration_seconds": 60.0,
+      "segment_coverage_seconds": {"load-1": 60.0},
+      "segment_sample_counts": {"load-1": 2}
+    }
+  ],
+  "analysis_digest": "f8a6…（纳入档案号与档案内容的 SHA-256）"
+}
+```
+
+校准语义与一致性保证：
+
+- **事务内读取档案**：指定 `profile_id` 的分析在**同一 SQLite 事务**内读取
+  该设备的不可变档案 → 按采样时刻选取区间校准 → 执行现有越界检测 →
+  落库批次。任一环节失败整体回滚。
+- **整批不得写入**：任一采样时刻无区间覆盖（`422`，含落在所有区段之外
+  的采样）、档案不存在（`404`）、档案属于其他设备（`409`，档案不匹配）
+  时，批次与异常都不会落库。
+- **摘要绑定档案**：`profile_id` 与档案内容同时纳入请求哈希与
+  `analysis_digest`，历史回放、处置复核与联单核对始终重算同一校准口径，
+  结果一致；相同采样有无档案、或档案内容不同，摘要都不同。
+- **旧调用不变**：未指定 `profile_id` 的请求按原始温度检测，请求哈希与
+  摘要口径与历史版本完全一致，既有批次的幂等与回放不受影响。
 
 ## 处置复核（绑定分析快照）
 
@@ -354,6 +482,14 @@ curl -X POST http://localhost:8000/api/v1/shipments/snapshot \
 - 区段时间重叠、`end <= start`、下限大于上限
 - `dip_tolerance_seconds > gap_seconds`
 - 空采样/空区段、时间戳格式错误等
+- 指定 `profile_id` 时：任一采样时刻无校准区间覆盖（档案不存在返回 404、
+  档案属于其他设备返回 409；以上情况整批不写入）
+
+## 参数校验（422，校准档案登记）
+
+- 区间为空、`end <= start`、未按时间排序或相互重叠（`[start, end)` 半开，
+  相邻区间允许首尾相接）
+- `scale` 非有限正数、`offset` 非有限数、时间戳格式错误
 
 ## 本地开发（不使用 Docker）
 
@@ -381,11 +517,11 @@ COLDCHAIN_DB=/tmp/test.db .venv/bin/python -m unittest discover -s tests -v
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由、序列化、幂等编排、复核/联单事务
-│   ├── detection.py   # 核心检测/合并/拆段/归因算法（纯函数，无 IO）
+│   ├── main.py        # FastAPI 路由、序列化、幂等编排、复核/联单/校准档案事务
+│   ├── detection.py   # 核心检测/合并/拆段/归因算法与温度校准（纯函数，无 IO）
 │   ├── models.py      # Pydantic 请求/响应模型与时间转换
-│   └── db.py          # SQLite 连接、建表、批次/案件/联单读写与事务
-├── tests/             # unittest 算法与 API 测试（63 个用例，含快照绑定、复核与联单幂等）
+│   └── db.py          # SQLite 连接、建表、批次/案件/联单/校准档案读写与事务
+├── tests/             # unittest 算法与 API 测试（88 个用例，含快照绑定、复核、联单与校准档案）
 ├── vendor/            # 本地依赖 wheel（离线安装）
 ├── requirements.txt
 ├── Dockerfile         # pip --no-index 离线安装

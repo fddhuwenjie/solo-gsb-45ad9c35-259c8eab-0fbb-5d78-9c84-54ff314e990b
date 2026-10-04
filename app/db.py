@@ -7,6 +7,10 @@
 比对快照、校验并写入案件处置行 / 联单批次行，任一步失败整体回滚
 （过期快照、缺失处置绝不落库）。联单落库后不可变更，相同联单号仅支持
 同内容幂等回放。
+
+``calibration_profiles`` 保存设备温度校准档案：档案号唯一、内容不可变，
+相同档案号仅同内容幂等回放；分析批次的写入在同一事务内读取档案、
+校准采样并落库，采样无覆盖或档案不匹配时整批回滚。
 """
 
 from __future__ import annotations
@@ -134,6 +138,14 @@ def init_db() -> None:
                                 CHECK (case_status IN ('open', 'closed')),
                 UNIQUE(shipment_id, seq)
             );
+
+            CREATE TABLE IF NOT EXISTS calibration_profiles (
+                profile_id   TEXT PRIMARY KEY,
+                device_id    TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                profile_json TEXT NOT NULL,
+                created_at   REAL NOT NULL
+            );
             """
         )
         # 旧库迁移：按旧口径写入的异常行没有 sample_counts_json 列。
@@ -206,6 +218,39 @@ _INSERT_ANOMALY_SQL = """
 """
 
 
+def _insert_batch_conn(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    device_id: str,
+    request_hash: str,
+    request_json: str,
+    anomalies: list[dict[str, Any]],
+) -> None:
+    """在给定事务/连接内写入批次与异常行。
+
+    batch_id 唯一约束冲突会抛 IntegrityError，由调用方按幂等/换内容
+    规则处理（SQLite 单语句失败不会中止所在事务）。
+    """
+    conn.execute(
+        """INSERT INTO batches
+           (batch_id, device_id, request_hash, request_json,
+            anomaly_count, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (
+            batch_id,
+            device_id,
+            request_hash,
+            request_json,
+            len(anomalies),
+            time.time(),
+        ),
+    )
+    conn.executemany(
+        _INSERT_ANOMALY_SQL,
+        [_anomaly_row(batch_id, i, a) for i, a in enumerate(anomalies)],
+    )
+
+
 def save_batch(
     batch_id: str,
     device_id: str,
@@ -217,24 +262,8 @@ def save_batch(
     with _write_lock:
         conn = _connect()
         try:
-            conn.execute(
-                """INSERT INTO batches
-                   (batch_id, device_id, request_hash, request_json,
-                    anomaly_count, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    batch_id,
-                    device_id,
-                    request_hash,
-                    request_json,
-                    len(anomalies),
-                    time.time(),
-                ),
-            )
-            conn.executemany(
-                _INSERT_ANOMALY_SQL,
-                [_anomaly_row(batch_id, i, a)
-                 for i, a in enumerate(anomalies)],
+            _insert_batch_conn(
+                conn, batch_id, device_id, request_hash, request_json, anomalies
             )
             conn.commit()
             return True
@@ -391,4 +420,36 @@ def save_shipment(
             for seq, batch_id, case_id, digest, handoff_at,
             anomaly_count, case_status in items
         ],
+    )
+
+
+# ---------- 设备温度校准档案 ----------
+
+
+def _select_profile(
+    conn: sqlite3.Connection, profile_id: str
+) -> Optional[dict[str, Any]]:
+    """事务内按档案号读取校准档案；不存在返回 None。"""
+    return conn.execute(
+        "SELECT * FROM calibration_profiles WHERE profile_id = ?", (profile_id,)
+    ).fetchone()
+
+
+def _insert_profile_conn(
+    conn: sqlite3.Connection,
+    profile_id: str,
+    device_id: str,
+    content_hash: str,
+    profile_json: str,
+) -> None:
+    """在给定事务/连接内写入不可变校准档案。
+
+    profile_id 唯一约束冲突会抛 IntegrityError，由调用方按幂等/换内容
+    规则处理。
+    """
+    conn.execute(
+        """INSERT INTO calibration_profiles
+           (profile_id, device_id, content_hash, profile_json, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (profile_id, device_id, content_hash, profile_json, time.time()),
     )

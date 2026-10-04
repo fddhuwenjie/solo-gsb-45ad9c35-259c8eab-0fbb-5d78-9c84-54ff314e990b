@@ -14,6 +14,14 @@
    含被收回的短暂回落点）；采样数相同则取峰值所属区段，再相同取最早区段。
 6. 未被任何区段覆盖的采样点不参与检测，并且其两侧的异常连续性被切断。
 
+校准
+----
+指定设备温度校准档案时，:func:`correct_samples` 在检测前按采样时刻把
+原始温度映射为校准温度（``corrected = raw * scale + offset``），随后
+``detect_anomalies`` 按上述规则对校准值检测。生效区间为 ``[start, end)``
+半开区间；任一采样时刻无区间覆盖即抛 :class:`CalibrationCoverageError`，
+调用方应整批拒绝、不得部分写入。
+
 时间统一使用 epoch 秒（浮点），由 API 层负责 ISO-8601 转换。
 """
 
@@ -39,6 +47,28 @@ class Segment:
     end: float  # epoch 秒；最后一个区段含，其余按半开 [start, end)
     lower_limit: float
     upper_limit: float
+
+
+@dataclass(frozen=True)
+class CalibrationInterval:
+    """设备温度校准生效区间：``[start, end)`` 半开。
+
+    区间内采样按 ``corrected = raw * scale + offset`` 校准；
+    ``scale`` 为有限的正数，``offset`` 为有限数。
+    """
+
+    start: float  # epoch 秒，含
+    end: float  # epoch 秒，不含
+    scale: float
+    offset: float
+
+
+class CalibrationCoverageError(ValueError):
+    """采样时刻未被校准档案的任何生效区间覆盖。"""
+
+    def __init__(self, timestamp: float):
+        super().__init__(f"采样时刻 {timestamp} 无校准区间覆盖")
+        self.timestamp = timestamp
 
 
 @dataclass
@@ -99,6 +129,46 @@ def _segment_at(
 
 def _is_violation(temperature: float, seg: Segment) -> bool:
     return temperature < seg.lower_limit or temperature > seg.upper_limit
+
+
+def _calibration_interval_at(
+    intervals: Sequence[CalibrationInterval], ts: float
+) -> Optional[CalibrationInterval]:
+    """定位 ts 所属的校准区间（``[start, end)`` 半开，区间互不重叠）。"""
+    lo, hi = 0, len(intervals) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        iv = intervals[mid]
+        if ts < iv.start:
+            hi = mid - 1
+        elif ts >= iv.end:
+            lo = mid + 1
+        else:
+            return iv
+    return None
+
+
+def correct_samples(
+    samples: Sequence[Sample],
+    intervals: Sequence[CalibrationInterval],
+) -> list[Sample]:
+    """按采样时刻选取校准区间，返回 ``raw * scale + offset`` 校准后的序列。
+
+    区间按 ``[start, end)`` 半开解释（末段右端同样不含）。任一采样时刻
+    无区间覆盖即抛 :class:`CalibrationCoverageError`——调用方必须整批
+    拒绝，不得只校准部分采样后继续。
+    """
+    ordered = sorted(intervals, key=lambda iv: iv.start)
+    corrected: list[Sample] = []
+    for s in samples:
+        iv = _calibration_interval_at(ordered, s.timestamp)
+        if iv is None:
+            raise CalibrationCoverageError(s.timestamp)
+        corrected.append(
+            Sample(timestamp=s.timestamp,
+                   temperature=s.temperature * iv.scale + iv.offset)
+        )
+    return corrected
 
 
 def _build_anomaly(device_id: str, group: _Group, segments: Sequence[Segment]) -> Anomaly:

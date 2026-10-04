@@ -2,7 +2,14 @@
 
 import unittest
 
-from app.detection import Sample, Segment, detect_anomalies
+from app.detection import (
+    CalibrationCoverageError,
+    CalibrationInterval,
+    Sample,
+    Segment,
+    correct_samples,
+    detect_anomalies,
+)
 
 DEVICE = "reefer-01"
 
@@ -261,6 +268,56 @@ class DetectionTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].peak_temperature, 10.5)
         self.assertEqual(result[0].direction, "high")
+
+
+class CalibrationTests(unittest.TestCase):
+    def test_correct_samples_applies_scale_and_offset(self):
+        """corrected = raw*scale + offset，按采样时刻逐点映射。"""
+        intervals = [CalibrationInterval(0, 100, 2.0, -1.0)]
+        out = correct_samples([Sample(0, 3.0), Sample(50, 4.0)], intervals)
+        self.assertEqual(
+            [(s.timestamp, s.temperature) for s in out],
+            [(0, 5.0), (50, 7.0)],
+        )
+
+    def test_correct_samples_selects_interval_by_timestamp(self):
+        """同一原始值在不同时刻落入不同区间，校准结果不同。"""
+        intervals = [
+            CalibrationInterval(0, 100, 2.0, 0.0),
+            CalibrationInterval(100, 200, 1.0, 0.0),
+        ]
+        out = correct_samples([Sample(50, 6.0), Sample(150, 6.0)], intervals)
+        self.assertEqual([s.temperature for s in out], [12.0, 6.0])
+
+    def test_correct_samples_half_open_boundary(self):
+        """边界时刻属于后一个区间（[start, end) 半开）。"""
+        intervals = [
+            CalibrationInterval(0, 100, 2.0, 0.0),
+            CalibrationInterval(100, 200, 1.0, 0.0),
+        ]
+        out = correct_samples([Sample(100, 9.0)], intervals)
+        self.assertEqual(out[0].temperature, 9.0)  # 恒等段，而非 18.0
+
+    def test_correct_samples_uncovered_raises(self):
+        """无覆盖时刻抛 CalibrationCoverageError；末段右端同样不含。"""
+        intervals = [CalibrationInterval(0, 100, 1.0, 0.0)]
+        for ts in (-1, 100, 250):
+            with self.assertRaises(CalibrationCoverageError) as ctx:
+                correct_samples([Sample(ts, 1.0)], intervals)
+            self.assertEqual(ctx.exception.timestamp, ts)
+
+    def test_corrected_samples_feed_detection(self):
+        """校准后的温度序列直接进入现有越界检测。"""
+        segments = [Segment("seg-1", "loading", 0, 600, 0.0, 8.0)]
+        # 原始 4.6/4.7 均达标；校准 2x-1 后 8.2/8.4 越界
+        samples = correct_samples(
+            [Sample(0, 4.6), Sample(60, 4.7)],
+            [CalibrationInterval(0, 600, 2.0, -1.0)],
+        )
+        result = detect_anomalies(DEVICE, samples, segments)
+        self.assertEqual(len(result), 1)
+        self.assertAlmostEqual(result[0].peak_temperature, 8.4)
+        self.assertEqual(result[0].peak_timestamp, 60)
 
 
 if __name__ == "__main__":

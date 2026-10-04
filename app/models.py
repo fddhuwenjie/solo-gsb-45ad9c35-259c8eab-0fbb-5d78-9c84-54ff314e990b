@@ -53,6 +53,15 @@ class AnalysisRequest(BaseModel):
         ..., min_length=1, max_length=128, description="客户端批次号，重复提交用于幂等回放"
     )
     device_id: str = Field(..., min_length=1, max_length=128)
+    profile_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description=(
+            "设备温度校准档案号；指定后按采样时刻选取生效区间，以 "
+            "corrected=raw*scale+offset 校准温度再执行越界检测；省略则按原始温度检测"
+        ),
+    )
     samples: list[SampleIn] = Field(..., min_length=1)
     segments: list[SegmentIn] = Field(..., min_length=1)
     gap_seconds: float = Field(
@@ -126,13 +135,18 @@ class AnomalyOut(BaseModel):
 class AnalysisResponse(BaseModel):
     batch_id: str
     device_id: str
+    profile_id: Optional[str] = Field(
+        default=None,
+        description="本次分析应用的校准档案号（温度均为校准值）；未指定档案时为 null",
+    )
     cached: bool = Field(..., description="true 表示幂等命中，结果来自存储回放")
     anomaly_count: int
     anomalies: list[AnomalyOut]
     analysis_digest: str = Field(
         ...,
         description=(
-            "重算后异常规范 JSON 的 SHA-256（十六进制）；处置复核必须原样回传，"
+            "重算后异常规范 JSON 的 SHA-256（十六进制）；指定校准档案的批次"
+            "会把档案号与档案内容一并纳入摘要。处置复核必须原样回传，"
             "服务端在同一事务中重算比对，不一致即快照过期（409）"
         ),
     )
@@ -255,3 +269,66 @@ class ShipmentSnapshotResponse(BaseModel):
         ..., description="总体结果：全部案件 closed 为 released；存在 open 案件为 held"
     )
     batches: list[ShipmentBatchOut]
+
+
+# ---------- 设备温度校准档案 ----------
+
+
+class CalibrationIntervalIn(BaseModel):
+    start: datetime
+    end: datetime
+    scale: float = Field(
+        ..., gt=0, allow_inf_nan=False,
+        description="校准斜率：有限的正数，corrected=raw*scale+offset",
+    )
+    offset: float = Field(
+        ..., allow_inf_nan=False, description="校准截距：有限数（摄氏度）"
+    )
+
+
+class CalibrationProfileRequest(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=128, description="设备标识")
+    profile_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="校准档案号；档案不可变，相同档案号同内容幂等回放，换内容返回 409",
+    )
+    intervals: list[CalibrationIntervalIn] = Field(
+        ..., min_length=1,
+        description="按时间排序、互不重叠的 [start, end) 生效区间（末段右端同样不含）",
+    )
+
+    @model_validator(mode="after")
+    def _validate_intervals(self) -> "CalibrationProfileRequest":
+        prev_end: Optional[float] = None
+        for index, iv in enumerate(self.intervals):
+            start, end = to_epoch(iv.start), to_epoch(iv.end)
+            if end <= start:
+                raise ValueError(f"校准区间第 {index + 1} 段的 end 必须晚于 start")
+            if prev_end is not None and start < prev_end:
+                raise ValueError(
+                    "校准区间必须按时间排序且互不重叠（[start, end) 半开，"
+                    "相邻区间允许首尾相接）"
+                )
+            prev_end = end
+        return self
+
+
+class CalibrationIntervalOut(BaseModel):
+    start: str
+    end: str
+    scale: float
+    offset: float
+
+
+class CalibrationProfileResponse(BaseModel):
+    device_id: str
+    profile_id: str
+    cached: bool = Field(..., description="true 表示相同档案同内容幂等回放")
+    intervals: list[CalibrationIntervalOut]
+    profile_digest: str = Field(
+        ...,
+        description=(
+            "档案内容规范 JSON 的 SHA-256（十六进制）；分析请求哈希与 "
+            "analysis_digest 均绑定同一档案内容"
+        ),
+    )

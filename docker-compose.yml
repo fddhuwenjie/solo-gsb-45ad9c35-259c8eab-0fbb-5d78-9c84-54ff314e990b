@@ -1,0 +1,25 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: coldchain-attribution:latest
+    container_name: coldchain-attribution
+    ports:
+      - "8000:8000"
+    volumes:
+      - coldchain-data:/data
+    environment:
+      # SQLite 数据库文件位置（与 VOLUME 对齐，容器重建后数据保留）
+      COLDCHAIN_DB: /data/coldchain.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  coldchain-data:

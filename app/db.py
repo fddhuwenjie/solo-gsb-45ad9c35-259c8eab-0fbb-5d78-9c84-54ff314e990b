@@ -63,6 +63,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS batches (
                 batch_id      TEXT PRIMARY KEY,
                 device_id     TEXT NOT NULL,
+                profile_id    TEXT,
                 request_hash  TEXT NOT NULL,
                 request_json  TEXT NOT NULL,
                 anomaly_count INTEGER NOT NULL,
@@ -134,6 +135,25 @@ def init_db() -> None:
                                 CHECK (case_status IN ('open', 'closed')),
                 UNIQUE(shipment_id, seq)
             );
+
+            CREATE TABLE IF NOT EXISTS calibration_profiles (
+                profile_id   TEXT PRIMARY KEY,
+                device_id    TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                created_at   REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS calibration_intervals (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id TEXT NOT NULL
+                           REFERENCES calibration_profiles(profile_id) ON DELETE CASCADE,
+                seq        INTEGER NOT NULL,
+                start_ts   REAL NOT NULL,
+                end_ts     REAL NOT NULL,
+                scale      REAL NOT NULL,
+                offset_value REAL NOT NULL,
+                UNIQUE(profile_id, seq)
+            );
             """
         )
         # 旧库迁移：按旧口径写入的异常行没有 sample_counts_json 列。
@@ -146,6 +166,13 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE anomalies ADD COLUMN sample_counts_json TEXT"
             )
+        # 旧库迁移：校准档案特性上线前的批次没有 profile_id 列（旧批次恒为 NULL）。
+        batch_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(batches)").fetchall()
+        }
+        if "profile_id" not in batch_cols:
+            conn.execute("ALTER TABLE batches ADD COLUMN profile_id TEXT")
 
 
 def _select_batch(
@@ -206,47 +233,66 @@ _INSERT_ANOMALY_SQL = """
 """
 
 
+def _save_batch_conn(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    device_id: str,
+    request_hash: str,
+    request_json: str,
+    anomalies: list[dict[str, Any]],
+    profile_id: Optional[str] = None,
+) -> None:
+    """在给定事务/连接内原子写入批次与异常（batch_id 冲突抛 IntegrityError）。"""
+    conn.execute(
+        """INSERT INTO batches
+           (batch_id, device_id, profile_id, request_hash, request_json,
+            anomaly_count, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            batch_id,
+            device_id,
+            profile_id,
+            request_hash,
+            request_json,
+            len(anomalies),
+            time.time(),
+        ),
+    )
+    conn.executemany(
+        _INSERT_ANOMALY_SQL,
+        [_anomaly_row(batch_id, i, a) for i, a in enumerate(anomalies)],
+    )
+
+
 def save_batch(
     batch_id: str,
     device_id: str,
     request_hash: str,
     request_json: str,
     anomalies: list[dict[str, Any]],
+    profile_id: Optional[str] = None,
 ) -> bool:
     """原子写入批次与异常。batch_id 已存在（并发重复提交）返回 False。"""
     with _write_lock:
         conn = _connect()
         try:
-            conn.execute(
-                """INSERT INTO batches
-                   (batch_id, device_id, request_hash, request_json,
-                    anomaly_count, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    batch_id,
-                    device_id,
-                    request_hash,
-                    request_json,
-                    len(anomalies),
-                    time.time(),
-                ),
-            )
-            conn.executemany(
-                _INSERT_ANOMALY_SQL,
-                [_anomaly_row(batch_id, i, a)
-                 for i, a in enumerate(anomalies)],
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                _save_batch_conn(
+                    conn, batch_id, device_id, request_hash,
+                    request_json, anomalies, profile_id=profile_id,
+                )
+            except sqlite3.IntegrityError:
+                # batch_id 唯一约束冲突：幂等回放，不视为错误
+                conn.rollback()
+                return False
             conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            # batch_id 唯一约束冲突：幂等回放，不视为错误
-            conn.rollback()
-            return False
         except BaseException:
             conn.rollback()
             raise
         finally:
             conn.close()
+    return True
 
 
 def _replace_anomalies_conn(
@@ -390,5 +436,68 @@ def save_shipment(
              handoff_at, anomaly_count, case_status)
             for seq, batch_id, case_id, digest, handoff_at,
             anomaly_count, case_status in items
+        ],
+    )
+
+
+# ---------- 设备温度校准档案 ----------
+
+
+def get_profile_for_update(
+    conn: sqlite3.Connection, profile_id: str
+) -> Optional[dict[str, Any]]:
+    """事务内读取不可变校准档案（含按序生效区间）；不存在返回 None。"""
+    profile = conn.execute(
+        "SELECT * FROM calibration_profiles WHERE profile_id = ?",
+        (profile_id,),
+    ).fetchone()
+    if profile is None:
+        return None
+    rows = conn.execute(
+        """SELECT start_ts, end_ts, scale, offset_value
+           FROM calibration_intervals WHERE profile_id = ? ORDER BY seq""",
+        (profile_id,),
+    ).fetchall()
+    return {
+        "profile": dict(profile),
+        "intervals": [dict(r) for r in rows],
+    }
+
+
+def get_profile(profile_id: str) -> Optional[dict[str, Any]]:
+    """读取校准档案（含生效区间）；不存在返回 None。"""
+    conn = _connect()
+    try:
+        result = get_profile_for_update(conn, profile_id)
+    finally:
+        conn.close()
+    return result
+
+
+def save_profile(
+    conn: sqlite3.Connection,
+    profile_id: str,
+    device_id: str,
+    content_hash: str,
+    intervals: list[tuple[float, float, float, float]],
+) -> None:
+    """在给定事务内写入不可变校准档案及其按序生效区间。
+
+    intervals 元素为 (start_epoch, end_epoch, scale, offset)。profile_id
+    唯一约束冲突会抛 IntegrityError，由调用方按幂等/换内容规则处理。
+    """
+    conn.execute(
+        """INSERT INTO calibration_profiles
+           (profile_id, device_id, content_hash, created_at)
+           VALUES (?, ?, ?, ?)""",
+        (profile_id, device_id, content_hash, time.time()),
+    )
+    conn.executemany(
+        """INSERT INTO calibration_intervals
+           (profile_id, seq, start_ts, end_ts, scale, offset_value)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        [
+            (profile_id, seq, start, end, scale, offset)
+            for seq, (start, end, scale, offset) in enumerate(intervals)
         ],
     )

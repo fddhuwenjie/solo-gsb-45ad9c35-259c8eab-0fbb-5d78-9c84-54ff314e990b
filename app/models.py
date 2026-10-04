@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 SegmentType = Literal["loading", "unloading", "transport"]
 
@@ -48,11 +48,78 @@ class SegmentIn(BaseModel):
     upper_limit: float = Field(..., description="区段温度上限（摄氏度，含）")
 
 
+# ---------- 设备温度校准档案 ----------
+
+
+class CalibrationIntervalIn(BaseModel):
+    """档案中一段按时间生效的校准系数：corrected = raw * scale + offset。"""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    start: datetime
+    end: datetime
+    scale: float = Field(
+        ..., gt=0, description="校准斜率（有限正数）；corrected = raw * scale + offset"
+    )
+    offset: float = Field(..., gt=0, description="校准偏移（有限正数）")
+
+
+class CalibrationProfileIn(BaseModel):
+    """设备温度校准档案提交：按时间排序、互不重叠的 [start,end) 生效区间。"""
+
+    device_id: str = Field(..., min_length=1, max_length=128)
+    profile_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="校准档案号；相同 profile_id 同内容幂等，换内容返回 409",
+    )
+    intervals: list[CalibrationIntervalIn] = Field(
+        ..., min_length=1, description="按时间排序、互不重叠的 [start,end) 生效区间（至少 1 段）"
+    )
+
+    @model_validator(mode="after")
+    def _validate_intervals(self) -> "CalibrationProfileIn":
+        ordered = sorted(self.intervals, key=lambda iv: to_epoch(iv.start))
+        for index, iv in enumerate(ordered, start=1):
+            start, end = to_epoch(iv.start), to_epoch(iv.end)
+            if end <= start:
+                raise ValueError(f"校准区间 {index} 的 end 必须晚于 start")
+            if index > 1:
+                prev_end = to_epoch(ordered[index - 2].end)
+                if prev_end > start:
+                    raise ValueError(f"校准区间 {index - 1} 与 {index} 时间重叠")
+        object.__setattr__(self, "intervals", ordered)
+        return self
+
+
+class CalibrationIntervalOut(BaseModel):
+    start: str
+    end: str
+    scale: float
+    offset: float
+
+
+class CalibrationProfileResponse(BaseModel):
+    device_id: str
+    profile_id: str
+    cached: bool = Field(..., description="true 表示相同档案号同内容幂等回放")
+    intervals: list[CalibrationIntervalOut]
+
+
 class AnalysisRequest(BaseModel):
     batch_id: str = Field(
         ..., min_length=1, max_length=128, description="客户端批次号，重复提交用于幂等回放"
     )
     device_id: str = Field(..., min_length=1, max_length=128)
+    profile_id: Optional[str] = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "设备温度校准档案号（可选）。指定后服务在事务内读取该设备的不可变档案，"
+            "按采样时刻选取 [start,end) 区间，以 corrected=raw*scale+offset 校准后再做"
+            "越界检测；任一采样无覆盖或档案与设备不匹配则整批拒绝（不落库）。"
+            "不指定时保持旧调用口径，温度按原始值直接检测。"
+        ),
+    )
     samples: list[SampleIn] = Field(..., min_length=1)
     segments: list[SegmentIn] = Field(..., min_length=1)
     gap_seconds: float = Field(
@@ -126,6 +193,10 @@ class AnomalyOut(BaseModel):
 class AnalysisResponse(BaseModel):
     batch_id: str
     device_id: str
+    profile_id: Optional[str] = Field(
+        default=None,
+        description="本次分析使用的设备温度校准档案号；未指定档案时为 null",
+    )
     cached: bool = Field(..., description="true 表示幂等命中，结果来自存储回放")
     anomaly_count: int
     anomalies: list[AnomalyOut]

@@ -19,16 +19,60 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Sequence
 
 Direction = Literal["high", "low"]
 
 
+class CalibrationGapError(ValueError):
+    """采样时刻未被校准档案的任何 [start, end) 区间覆盖。"""
+
+    def __init__(self, timestamp: float):
+        self.timestamp = timestamp
+        super().__init__(f"采样时刻 {timestamp} 无校准区间覆盖")
+
+
 @dataclass(frozen=True)
 class Sample:
     timestamp: float  # epoch 秒
     temperature: float
+
+
+@dataclass(frozen=True)
+class CalibrationInterval:
+    """校准系数生效区间（半开 [start, end)）。"""
+
+    start: float  # epoch 秒，含
+    end: float  # epoch 秒，不含
+    scale: float
+    offset: float
+
+
+def apply_calibration(
+    samples: Sequence[Sample], intervals: Sequence[CalibrationInterval]
+) -> list[Sample]:
+    """按 ``corrected = raw * scale + offset`` 校准全部采样。
+
+    区间按 ``[start, end)`` 半开划分时间轴（按 start 排序、互不重叠，
+    由 API 层保证）；任一采样时刻未被覆盖即抛 :class:`CalibrationGapError`，
+    由调用方整体拒绝、绝不部分写入。
+    """
+    ordered = sorted(intervals, key=lambda iv: iv.start)
+    starts = [iv.start for iv in ordered]
+    calibrated: list[Sample] = []
+    for s in samples:
+        # 最后一个 start <= ts 的候选区间，再校验 ts < end
+        idx = bisect_right(starts, s.timestamp) - 1
+        if idx < 0 or s.timestamp >= ordered[idx].end:
+            raise CalibrationGapError(s.timestamp)
+        iv = ordered[idx]
+        calibrated.append(
+            Sample(s.timestamp, s.temperature * iv.scale + iv.offset)
+        )
+    return calibrated
+
 
 
 @dataclass(frozen=True)

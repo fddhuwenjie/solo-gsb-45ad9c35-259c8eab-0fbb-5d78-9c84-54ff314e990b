@@ -4,19 +4,32 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import RedirectResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from . import db
-from .detection import Anomaly, Sample, Segment, detect_anomalies
+from .detection import (
+    Anomaly,
+    CalibrationGapError,
+    CalibrationInterval,
+    Sample,
+    Segment,
+    apply_calibration,
+    detect_anomalies,
+)
 from .models import (
     AnalysisRequest,
     AnalysisResponse,
     AnomalyOut,
+    CalibrationProfileIn,
+    CalibrationProfileResponse,
+    CalibrationIntervalOut,
     CaseReviewRequest,
     CaseReviewResponse,
     DecisionOut,
@@ -36,19 +49,50 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="冷链温区异常归因 API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "按装卸/运输区段的温度上下限检测连续越界，容忍短暂回落、"
         "跨采样缺口拆段，并按异常区间内实际采样时刻数量将异常归因到"
         "对应区段；历史回放一律依据保存的原始采样重算，修正旧口径归因。"
-        "处置复核绑定分析快照；运输联单在同一事务内逐批次核对快照与案件"
-        "处置后落库，给出 released/held 风险结论。"
+        "可选设备温度校准档案：按采样时刻以 raw*scale+offset 校准后检测，"
+        "档案标识与内容进入请求哈希与分析摘要。处置复核绑定分析快照；"
+        "运输联单在同一事务内逐批次核对快照与案件处置后落库，"
+        "给出 released/held 风险结论。"
     ),
     lifespan=lifespan,
 )
 
 
 # ---------- 序列化与计算 ----------
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """422 错误体里回显的非有限浮点（inf/NaN，如非法校准系数）无法被
+    ``JSONResponse`` 序列化，会导致 500；这里将错误回显中的非有限值替换为
+    字符串占位，保持 422 语义与现有 detail 结构不变。
+    """
+
+    def _sanitize(value: Any) -> Any:
+        if isinstance(value, float) and not math.isfinite(value):
+            return "non-finite"
+        if isinstance(value, dict):
+            # pydantic v2 的 ctx 会携带原始异常对象，JSON 不可序列化且无需回显
+            return {
+                k: _sanitize(v)
+                for k, v in value.items()
+                if k != "ctx"
+            }
+        if isinstance(value, list):
+            return [_sanitize(v) for v in value]
+        return value
+
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _sanitize(exc.errors())},
+    )
 
 
 def _round3(value: float) -> float:
@@ -99,17 +143,113 @@ def _canonical_anomaly_json(anomalies: list[dict[str, Any]]) -> str:
                       separators=(",", ":"))
 
 
-def _analysis_digest(anomalies: list[dict[str, Any]]) -> str:
-    """重算后异常规范 JSON 的 SHA-256；处置必须绑定该摘要，防快照过期。"""
-    canonical = _canonical_anomaly_json(anomalies)
+# ---------- 设备温度校准档案 ----------
+
+
+def _profile_descriptor(profile: dict[str, Any]) -> dict[str, Any]:
+    """档案标识与内容的确定结构：进入请求哈希与 analysis_digest。
+
+    时间用 epoch 秒、系数为有限数值，保证历史回放、处置复核与联单核对
+    拿到逐字节一致的序列化结果。
+    """
+    return {
+        "profile_id": profile["profile"]["profile_id"],
+        "intervals": [
+            {
+                "start": iv["start_ts"],
+                "end": iv["end_ts"],
+                "scale": iv["scale"],
+                "offset": iv["offset_value"],
+            }
+            for iv in profile["intervals"]
+        ],
+    }
+
+
+def _calibration_intervals(
+    descriptor: Optional[dict[str, Any]],
+) -> Optional[list[CalibrationInterval]]:
+    if descriptor is None:
+        return None
+    return [
+        CalibrationInterval(
+            start=iv["start"],
+            end=iv["end"],
+            scale=iv["scale"],
+            offset=iv["offset"],
+        )
+        for iv in descriptor["intervals"]
+    ]
+
+
+def _resolve_profile_conn(
+    conn: Any, profile_id: str, device_id: str
+) -> dict[str, Any]:
+    """事务内读取设备的不可变校准档案；不存在或档案属于其他设备即 409。"""
+    profile = db.get_profile_for_update(conn, profile_id)
+    if profile is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"profile_id={profile_id} 不存在，请先提交设备温度校准档案"
+            ),
+        )
+    if profile["profile"]["device_id"] != device_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"profile_id={profile_id} 属于设备 "
+                f"{profile['profile']['device_id']}，与本次 device_id="
+                f"{device_id} 不匹配"
+            ),
+        )
+    return profile
+
+
+def _analysis_digest(
+    anomalies: list[dict[str, Any]],
+    profile_descriptor: Optional[dict[str, Any]] = None,
+) -> str:
+    """重算后异常规范 JSON 的 SHA-256；处置必须绑定该摘要，防快照过期。
+
+    使用校准档案时，摘要输入为 ``{"anomalies": ..., "profile": 档案标识与内容}``；
+    未指定档案时保持只对异常列表取摘要的旧口径，旧调用结果不变。
+    """
+    if profile_descriptor is None:
+        canonical = _canonical_anomaly_json(anomalies)
+    else:
+        canonical = json.dumps(
+            {"anomalies": anomalies, "profile": profile_descriptor},
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _run_detection(req: AnalysisRequest) -> list[dict[str, Any]]:
+def _run_detection(
+    req: AnalysisRequest,
+    profile_descriptor: Optional[dict[str, Any]] = None,
+) -> list[dict[str, Any]]:
     samples = [
         Sample(timestamp=to_epoch(s.timestamp), temperature=s.temperature)
         for s in req.samples
     ]
+    # 指定档案时先按采样时刻校准（corrected=raw*scale+offset），再做越界检测；
+    # 任一采样无区间覆盖抛 CalibrationGapError，由路由层整体拒绝（422）。
+    intervals = _calibration_intervals(profile_descriptor)
+    if intervals is not None:
+        try:
+            samples = apply_calibration(samples, intervals)
+        except CalibrationGapError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"采样时刻 {from_epoch(exc.timestamp)} 未被校准档案 "
+                    f"{req.profile_id} 的任何 [start,end) 生效区间覆盖；"
+                    "整批不得写入，请补齐档案后重试"
+                ),
+            ) from exc
     segments = [
         Segment(
             segment_id=s.segment_id,
@@ -131,9 +271,23 @@ def _run_detection(req: AnalysisRequest) -> list[dict[str, Any]]:
     return [_anomaly_to_internal(a) for a in anomalies]
 
 
-def _canonical_hash(req: AnalysisRequest) -> str:
-    """对请求体（剔除 batch_id）做规范化哈希，用于识别同号不同内容。"""
+def _canonical_hash(
+    req: AnalysisRequest,
+    profile_descriptor: Optional[dict[str, Any]] = None,
+) -> str:
+    """对请求体（剔除 batch_id）做规范化哈希，用于识别同号不同内容。
+
+    指定校准档案时，档案标识与内容（解析后的确定结构）一并入哈希：
+    换档案、档案区间不同都会得到不同哈希。未指定档案时，载荷剔除
+    profile_id 键，使规范化结果与档案特性上线前的旧调用逐字节一致——
+    旧批次（旧库中无 profile_id 字段时算出的哈希）仍能正常幂等回放。
+    """
     payload = req.model_dump(mode="json", exclude={"batch_id"})
+    if profile_descriptor is not None:
+        # 以解析后的档案内容覆盖入参里的 profile_id 引用
+        payload["profile"] = profile_descriptor
+    else:
+        payload.pop("profile_id", None)
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False,
                            separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -182,14 +336,20 @@ def _stored_row_signatures(stored: dict[str, Any]) -> list[str]:
 
 def _recompute_batch_conn(
     conn: Any, stored: dict[str, Any]
-) -> tuple[str, list[dict[str, Any]]]:
+) -> tuple[str, list[dict[str, Any]], Optional[dict[str, Any]]]:
     """在给定事务/连接内依据原始采样重算；已存行属旧口径时原子覆盖。
 
-    返回 (device_id, 最新口径的异常列表)。重复 POST、按批次 GET 与处置复核
-    共用此路径，保证旧口径写入的数据不会被直接回放。
+    返回 (device_id, 最新口径的异常列表, 档案描述)。档案描述来自保存的
+    原始请求：批次使用校准时在同一事务内读取不可变档案再按档案重放，
+    保证历史回放、处置复核与联单核对使用同一份校准结果。重复 POST、
+    按批次 GET、处置复核与联单核对共用此路径。
     """
     req = _request_from_stored(stored)
-    fresh = _run_detection(req)
+    descriptor: Optional[dict[str, Any]] = None
+    if req.profile_id:
+        profile = _resolve_profile_conn(conn, req.profile_id, req.device_id)
+        descriptor = _profile_descriptor(profile)
+    fresh = _run_detection(req, descriptor)
 
     # 与已存行比较；旧口径行（缺少 sample_counts 或归因不同）整体替换。
     stored_signatures = _stored_row_signatures(stored)
@@ -199,14 +359,7 @@ def _recompute_batch_conn(
     if stored_signatures != fresh_signatures:
         db._replace_anomalies_conn(conn, req.batch_id, fresh)
 
-    return req.device_id, fresh
-
-
-def _replay_batch(stored: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
-    """独立连接上的重算回放（POST 幂等命中与 GET 使用）。"""
-    with db.transaction() as conn:
-        device_id, fresh = _recompute_batch_conn(conn, stored)
-    return device_id, fresh
+    return req.device_id, fresh, descriptor
 
 
 def _build_response(
@@ -214,14 +367,17 @@ def _build_response(
     device_id: str,
     anomalies: list[dict[str, Any]],
     cached: bool,
+    profile_id: Optional[str] = None,
+    profile_descriptor: Optional[dict[str, Any]] = None,
 ) -> AnalysisResponse:
     return AnalysisResponse(
         batch_id=batch_id,
         device_id=device_id,
+        profile_id=profile_id,
         cached=cached,
         anomaly_count=len(anomalies),
         anomalies=[_internal_to_out(i, a) for i, a in enumerate(anomalies)],
-        analysis_digest=_analysis_digest(anomalies),
+        analysis_digest=_analysis_digest(anomalies, profile_descriptor),
     )
 
 
@@ -242,59 +398,249 @@ def health() -> dict[str, str]:
 def analyze(req: AnalysisRequest, response: Response) -> AnalysisResponse:
     """提交一批采样序列进行异常归因；相同 batch_id 重复提交幂等回放。
 
+    指定 ``profile_id`` 时在**同一 SQLite 事务**内读取该设备的不可变
+    校准档案，按采样时刻选取 ``[start,end)`` 区间，以
+    ``corrected=raw*scale+offset`` 校准后再做越界检测；档案不存在、档案
+    属于其他设备（409）或任一采样无区间覆盖（422）时整批拒绝、绝不写入。
+
     命中历史批次时，结果不是直接读取旧异常行，而是依据保存的原始采样与
     区段重算——旧口径写入的错误归因会在回放中被修正，并回写最新结果。
     """
-    stored = db.get_batch(req.batch_id)
-    if stored is not None:
-        request_hash = _canonical_hash(req)
-        if stored["batch"]["request_hash"] != request_hash:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"batch_id={req.batch_id} 已存在但请求内容不同；"
-                    "幂等要求同一批次号只对应一份数据"
-                ),
+    with db.transaction() as conn:
+        batch_row = db._select_batch(conn, req.batch_id)
+        if batch_row is not None:
+            stored = {
+                "batch": dict(batch_row),
+                "anomalies": db._select_anomalies(conn, req.batch_id),
+            }
+            # 回放同样需要档案描述（档案缺失/不匹配在事务内即 409），
+            # 保证哈希比对与摘要口径一致。
+            descriptor: Optional[dict[str, Any]] = None
+            if req.profile_id:
+                profile = _resolve_profile_conn(
+                    conn, req.profile_id, req.device_id
+                )
+                descriptor = _profile_descriptor(profile)
+            request_hash = _canonical_hash(req, descriptor)
+            if stored["batch"]["request_hash"] != request_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"batch_id={req.batch_id} 已存在但请求内容不同；"
+                        "幂等要求同一批次号只对应一份数据"
+                    ),
+                )
+            _device_id, anomalies, replay_descriptor = (
+                _recompute_batch_conn(conn, stored)
             )
-        response.headers["X-Cache"] = "HIT"
-        device_id, anomalies = _replay_batch(stored)
-        return _build_response(req.batch_id, device_id, anomalies, cached=True)
+            response.headers["X-Cache"] = "HIT"
+            return _build_response(
+                req.batch_id,
+                _device_id,
+                anomalies,
+                cached=True,
+                profile_id=stored["batch"].get("profile_id"),
+                profile_descriptor=replay_descriptor,
+            )
 
-    anomalies = _run_detection(req)
-    request_hash = _canonical_hash(req)
-    request_json = json.dumps(
-        req.model_dump(mode="json"), ensure_ascii=False, sort_keys=True
-    )
-    created = db.save_batch(
-        batch_id=req.batch_id,
-        device_id=req.device_id,
-        request_hash=request_hash,
-        request_json=request_json,
-        anomalies=anomalies,
-    )
+        # 新批次：先在事务内解析档案（不存在/不匹配即 409 回滚），
+        # 再校准检测（无覆盖即 422 回滚），最后与批次行同事务落库。
+        descriptor = None
+        if req.profile_id:
+            profile = _resolve_profile_conn(conn, req.profile_id, req.device_id)
+            descriptor = _profile_descriptor(profile)
 
-    if not created:
-        # 并发下另一请求抢先写入：按幂等规则回放（同样重算，不盲信旧行）
-        stored = db.get_batch(req.batch_id)
-        assert stored is not None
-        if stored["batch"]["request_hash"] != request_hash:
-            raise HTTPException(status_code=409, detail="批次号已被其他内容占用")
-        response.headers["X-Cache"] = "HIT"
-        device_id, replayed = _replay_batch(stored)
-        return _build_response(req.batch_id, device_id, replayed, cached=True)
+        anomalies = _run_detection(req, descriptor)
+        request_hash = _canonical_hash(req, descriptor)
+        request_json = json.dumps(
+            req.model_dump(mode="json"), ensure_ascii=False, sort_keys=True
+        )
 
-    response.headers["X-Cache"] = "MISS"
-    return _build_response(req.batch_id, req.device_id, anomalies, cached=False)
+        try:
+            db._save_batch_conn(
+                conn,
+                batch_id=req.batch_id,
+                device_id=req.device_id,
+                request_hash=request_hash,
+                request_json=request_json,
+                anomalies=anomalies,
+                profile_id=req.profile_id,
+            )
+        except sqlite3.IntegrityError as exc:
+            # 并发下另一请求抢先写入：按幂等规则回放（同样重算，不盲信旧行）
+            batch_row = db._select_batch(conn, req.batch_id)
+            assert batch_row is not None
+            stored = {
+                "batch": dict(batch_row),
+                "anomalies": db._select_anomalies(conn, req.batch_id),
+            }
+            if stored["batch"]["request_hash"] != request_hash:
+                raise HTTPException(
+                    status_code=409, detail="批次号已被其他内容占用"
+                ) from exc
+            _device_id, replayed, replay_descriptor = (
+                _recompute_batch_conn(conn, stored)
+            )
+            response.headers["X-Cache"] = "HIT"
+            return _build_response(
+                req.batch_id,
+                _device_id,
+                replayed,
+                cached=True,
+                profile_id=stored["batch"].get("profile_id"),
+                profile_descriptor=replay_descriptor,
+            )
+
+        response.headers["X-Cache"] = "MISS"
+        return _build_response(
+            req.batch_id,
+            req.device_id,
+            anomalies,
+            cached=False,
+            profile_id=req.profile_id,
+            profile_descriptor=descriptor,
+        )
 
 
 @app.get("/api/v1/batches/{batch_id}", response_model=AnalysisResponse)
 def get_batch(batch_id: str) -> AnalysisResponse:
     """按批次号回放历史分析结果（依据原始采样重算，自动修正旧口径归因）。"""
-    stored = db.get_batch(batch_id)
-    if stored is None:
-        raise HTTPException(status_code=404, detail=f"批次 {batch_id} 不存在")
-    device_id, anomalies = _replay_batch(stored)
-    return _build_response(batch_id, device_id, anomalies, cached=True)
+    with db.transaction() as conn:
+        batch_row = db._select_batch(conn, batch_id)
+        if batch_row is None:
+            raise HTTPException(status_code=404, detail=f"批次 {batch_id} 不存在")
+        stored = {
+            "batch": dict(batch_row),
+            "anomalies": db._select_anomalies(conn, batch_id),
+        }
+        device_id, anomalies, descriptor = _recompute_batch_conn(conn, stored)
+        return _build_response(
+            batch_id,
+            device_id,
+            anomalies,
+            cached=True,
+            profile_id=stored["batch"].get("profile_id"),
+            profile_descriptor=descriptor,
+        )
+
+
+# ---------- 设备温度校准档案 ----------
+
+
+def _profile_content_hash(req: CalibrationProfileIn) -> str:
+    """档案内容（设备 + 按序生效区间及系数）的规范化哈希。
+
+    相同 profile_id 只有逐字节一致才幂等回放；任一区间边界或系数变化
+    都会得到不同哈希（档案不可变，换内容返回 409）。
+    """
+    payload = {
+        "device_id": req.device_id,
+        "intervals": [
+            {
+                "start": to_epoch(iv.start),
+                "end": to_epoch(iv.end),
+                "scale": iv.scale,
+                "offset": iv.offset,
+            }
+            for iv in req.intervals
+        ],
+    }
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                           separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _build_profile_response(
+    profile: dict[str, Any], cached: bool
+) -> CalibrationProfileResponse:
+    return CalibrationProfileResponse(
+        device_id=profile["profile"]["device_id"],
+        profile_id=profile["profile"]["profile_id"],
+        cached=cached,
+        intervals=[
+            CalibrationIntervalOut(
+                start=from_epoch(iv["start_ts"]),
+                end=from_epoch(iv["end_ts"]),
+                scale=iv["scale"],
+                offset=iv["offset_value"],
+            )
+            for iv in profile["intervals"]
+        ],
+    )
+
+
+@app.post(
+    "/api/v1/calibration-profiles",
+    response_model=CalibrationProfileResponse,
+)
+def submit_calibration_profile(
+    req: CalibrationProfileIn, response: Response
+) -> CalibrationProfileResponse:
+    """提交设备温度校准档案（不可变）：同 profile_id 同内容幂等，换内容 409。
+
+    区间按 ``[start, end)`` 半开生效、按时间排序且互不重叠（允许首尾相接），
+    每段含有限正 ``scale`` 与正 ``offset``。档案一旦写入不可变更，分析时
+    按采样时刻选取区间做 ``corrected=raw*scale+offset`` 校准。
+    """
+    content_hash = _profile_content_hash(req)
+
+    with db.transaction() as conn:
+        existing = db.get_profile_for_update(conn, req.profile_id)
+        if existing is not None:
+            if existing["profile"]["content_hash"] != content_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"profile_id={req.profile_id} 已存在但提交内容不同；"
+                        "校准档案不可变更，仅支持同内容幂等回放"
+                    ),
+                )
+            response.headers["X-Cache"] = "HIT"
+            return _build_profile_response(existing, cached=True)
+
+        intervals = [
+            (
+                to_epoch(iv.start),
+                to_epoch(iv.end),
+                iv.scale,
+                iv.offset,
+            )
+            for iv in req.intervals
+        ]
+        try:
+            db.save_profile(
+                conn,
+                profile_id=req.profile_id,
+                device_id=req.device_id,
+                content_hash=content_hash,
+                intervals=intervals,
+            )
+        except sqlite3.IntegrityError as exc:
+            # 并发下档案已被其他内容抢先创建：按内容判定幂等/冲突
+            existing = db.get_profile_for_update(conn, req.profile_id)
+            assert existing is not None
+            if existing["profile"]["content_hash"] != content_hash:
+                raise HTTPException(
+                    status_code=409, detail="档案号已被其他内容占用"
+                ) from exc
+            response.headers["X-Cache"] = "HIT"
+            return _build_profile_response(existing, cached=True)
+
+        response.headers["X-Cache"] = "MISS"
+        return CalibrationProfileResponse(
+            device_id=req.device_id,
+            profile_id=req.profile_id,
+            cached=False,
+            intervals=[
+                CalibrationIntervalOut(
+                    start=from_epoch(start),
+                    end=from_epoch(end),
+                    scale=scale,
+                    offset=offset,
+                )
+                for start, end, scale, offset in intervals
+            ],
+        )
 
 
 # ---------- 处置复核 ----------
@@ -388,8 +734,10 @@ def submit_case_review(req: CaseReviewRequest, response: Response) -> CaseReview
 
         # 重算并在同一事务内比对摘要：快照过期直接 409（事务随异常回滚）。
         # 与 GET 一样，若库存异常行属旧口径会先被重算结果覆盖，保证摘要口径统一。
-        _device_id, anomalies = _recompute_batch_conn(conn, stored_batch)
-        current_digest = _analysis_digest(anomalies)
+        _device_id, anomalies, profile_descriptor = _recompute_batch_conn(
+            conn, stored_batch
+        )
+        current_digest = _analysis_digest(anomalies, profile_descriptor)
         if current_digest != req.analysis_digest:
             raise HTTPException(
                 status_code=409,
@@ -585,8 +933,10 @@ def create_shipment_snapshot(
 
             # 重算并在同一事务内比对摘要：批次过期直接 409（事务随异常回滚，
             # 旧口径行的重算覆盖也不会落库）。
-            _device_id, anomalies = _recompute_batch_conn(conn, stored_batch)
-            current_digest = _analysis_digest(anomalies)
+            _device_id, anomalies, profile_descriptor = (
+                _recompute_batch_conn(conn, stored_batch)
+            )
+            current_digest = _analysis_digest(anomalies, profile_descriptor)
             if current_digest != item.analysis_digest:
                 raise HTTPException(
                     status_code=409,
